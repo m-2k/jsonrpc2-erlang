@@ -1,4 +1,5 @@
 %% Copyright 2013-2014 Viktor Söderqvist
+%% Copyright 2025 Andy (https://github.com/m-2k)
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -15,173 +16,236 @@
 %% @doc JSON-RPC 2.0 client
 -module(jsonrpc2_client).
 
--export_type([request/0, response/0]).
--export([create_request/1, parse_response/1, batch_call/5]).
+-include_lib("kernel/include/logger.hrl").
 
--type call_req() :: {jsonrpc2:method(), jsonrpc2:params(), jsonrpc2:id()}.
--type notification_req() :: {jsonrpc2:method(), jsonrpc2:params()}.
--type batch_req() :: [call_req() | notification_req()].
--type request() :: call_req() | notification_req() | batch_req().
+-export_type([
+	request_spec/0,
+	transport_fn/0,
+	response/0
+]).
 
--type response() :: {ok, jsonrpc2:json()} | {error, jsonrpc2:error()}.
+-export([
+	call/2,
+	multi_call/3
+]).
 
--type transportfun() :: fun ((binary()) -> binary()).
--type json_encode() :: fun ((jsonrpc2:json()) -> binary()).
--type json_decode() :: fun ((binary()) -> jsonrpc2:json()).
 
-%% @doc Creates a call, notification or batch request, depending on the parameter.
--spec create_request(request()) -> jsonrpc2:json().
-create_request({Method, Params}) ->
-	{[{<<"jsonrpc">>, <<"2.0">>},
-	  {<<"method">>, Method},
-	  {<<"params">>, Params}]};
-create_request({Method, Params, Id}) ->
-	{[{<<"jsonrpc">>, <<"2.0">>},
-	  {<<"method">>, Method},
-	  {<<"params">>, Params},
-	  {<<"id">>, Id}]};
-create_request(Reqs) when is_list(Reqs) ->
-	lists:map(fun create_request/1, Reqs).
+-type request_id() :: atom() | binary() | integer() | null | auto. % auto – internal option, uses only with multi_call/3
+-type request_method() :: atom() | binary().
+-type request_params() :: [ json:encode_value() ] | #{ binary() | atom() | integer() => json:encode_value() }.
+-type request_context() :: any().
 
-%% @doc Parses a structured response (already json-decoded) and returns a list of pairs, with id
-%% and a tuple {ok, Reply} or {error, Error}.
-%% TODO: Define the structure of Error.
--spec parse_response(jsonrpc2:json()) -> [{jsonrpc2:id(), response()}].
-parse_response({_} = Response) ->
-	[parse_single_response(Response)];
-parse_response(BatchResponse) when is_list(BatchResponse) ->
-	lists:map(fun parse_single_response/1, BatchResponse).
+-type call_request() :: #{
+	id := request_id(),
+	method := request_method(),
+	params => request_params(),
+	context => request_context()
+}.
 
-%% @doc Calls multiple methods as a batch call and returns the results in the same order.
-%% TODO: Sort out what this function returns in the different error cases.
--spec batch_call([{jsonrpc2:method(), jsonrpc2:params()}], transportfun(),
-                 json_decode(), json_encode(), FirstId :: integer()) ->
-	[response()].
-batch_call(MethodsAndParams, TransportFun, JsonDecode, JsonEncode, FirstId) ->
-	MethodParamsIds = enumerate_call_tuples(MethodsAndParams, FirstId),
-	JsonReq = create_request(MethodParamsIds),
-	BinReq = JsonEncode(JsonReq),
-	try
-		%% The transport fun can fail gracefully by throwing {transport_error, binary()}
-		BinResp = try TransportFun(BinReq)
-		catch throw:{transport_error, TransportError} when is_binary(TransportError) ->
-			throw({jsonrpc2_client, TransportError})
-		end,
+-type notification_request() :: #{
+	method := request_method(),
+	params => request_params(),
+	context => request_context()
+}.
 
-		%% JsonDecode can fail (any kind of error)
-		JsonResp = try JsonDecode(BinResp)
-		catch _:_ -> throw({jsonrpc2_client, invalid_json})
-		end,
+-type request_spec() :: call_request() | notification_request().
+-type transport_fn() :: fun ((iodata()) -> binary()).
 
-		%% parse_response can fail by throwing invalid_jsonrpc_response
-		RepliesById = try parse_response(JsonResp)
-		catch throw:invalid_jsonrpc_response ->
-			throw({jsonrpc2_client, invalid_jsonrpc_response})
-		end,
+-type error_response() ::
+	#{
+		code => integer(),
+		message => binary(),
+		data => json:decode_value()}
+	| #{
+		code => integer(),
+		message => binary()}.
 
-		%% Decompose the replies into a list in the same order as MethodsAndParams.
-		LastId = FirstId + length(MethodsAndParams) - 1,
-		denumerate_replies(RepliesById, FirstId, LastId)
+-type response() ::
+	{ok, json:decode_value()}
+	| {error, {invalid_response, json:decode_value()}}
+	| {error, {error_response, error_response()}}.
 
-	catch throw:{jsonrpc2_client, ErrorData} ->
-		%% Failure in transport function. Repeat the error data for each request to
-		%% simulate a batch response.
-		lists:duplicate(length(MethodsAndParams), {error, {server_error, ErrorData}})
+
+-spec call(RequestSpec :: request_spec(), TransportFn :: transport_fn()) -> response().
+call(RequestSpec, TransportFn) ->
+	Req = request(RequestSpec),
+	maybe
+		{ok, ReqBin} ?= safe_eval(json_encoder, json, encode, [Req]),
+		{ok, RespBin} ?= safe_eval(transport, TransportFn, [ReqBin]),
+		{ok, ReqId} ?= case Req of #{id := Id} -> {ok, Id}; #{} -> ok end, % notification
+		{ok, Resp} ?= safe_eval(json_decoder, json, decode, [RespBin]),
+		{ok, _Result} ?= parse_response(Resp, [ReqId])
+	else
+		 Result -> Result
 	end.
 
-%%----------
-%% Internal
-%%----------
 
-%% @doc Helper for parse_response/1. Returns a single pair {Id, Response}.
--spec parse_single_response(jsonrpc2:json()) -> {jsonrpc2:id(), response()}.
-parse_single_response({Response}) ->
-	<<"2.0">> == proplists:get_value(<<"jsonrpc">>, Response)
-		orelse throw(invalid_jsonrpc_response),
-	Id      = proplists:get_value(<<"id">>, Response),
-	is_number(Id) orelse Id == null
-		orelse throw(invalid_jsonrpc_response),
-	Result  = proplists:get_value(<<"result">>, Response, undefined),
-	Error   = proplists:get_value(<<"error">>, Response, undefined),
-	Reply = case {Result, Error} of
-		{undefined, undefined} ->
-			{error, {server_error, <<"Invalid JSON-RPC 2.0 response">>}};
-		{_, undefined} ->
-			{ok, Result};
-		{undefined, {ErrorProplist}} ->
-			Code = proplists:get_value(<<"code">>, ErrorProplist, -32000),
-			Message = proplists:get_value(<<"message">>, ErrorProplist, <<"Unknown error">>),
-			ErrorTuple = case proplists:get_value(<<"data">>, ErrorProplist) of
-			    undefined ->
-					{jsonrpc2, Code, Message};
-			    Data ->
-					{jsonrpc2, Code, Message, Data}
-			end,
-			{error, ErrorTuple};
-		_ ->
-			%% both error and result
-			{error, {server_error, <<"Invalid JSON-RPC 2.0 response">>}}
+-spec multi_call(RequestSpecs :: [ request_spec() ], TransportFn :: transport_fn(), AutoIdStart :: integer()) -> response().
+multi_call(RequestSpecs, TransportFn, AutoIdStart) ->
+	{SpecsWithId, _} = lists:mapfoldl(fun
+		(RS = #{id := auto}, Id) -> {RS#{id => Id}, Id + 1};
+		(RS, Id) -> {RS, Id}
+	end, AutoIdStart, RequestSpecs),
+	Ids = [ Id || #{id := Id} <- SpecsWithId ],
+	Req = [ request(RS) || RS <- SpecsWithId],
+	
+	maybe
+		{ok, ReqBin} ?= safe_eval(json_encoder, json, encode, [Req]),
+		{ok, RespBin} ?= safe_eval(transport, TransportFn, [ReqBin]),
+		{ok, _} ?= case RespBin of <<>> -> ok; _ -> {ok, RespBin} end, % empty reply
+		{ok, Resp} ?= safe_eval(json_decoder, json, decode, [RespBin]),
+		case Resp of
+			[_|_] ->
+				[ begin
+					Ctx = find_context(R, SpecsWithId),
+					list_to_tuple(tuple_to_list(parse_response(R, Ids)) ++ [Ctx])
+				end || R <- Resp ]
+		end
+	else
+		Result -> Result
+	end.
+
+
+find_context(#{~"id" := Id} = _Resp, SpecsWithId) ->
+	Search = fun
+		(#{id := SpecId}) -> SpecId =:= Id;
+		(#{ }) -> false
 	end,
-	{Id, Reply}.
+	case lists:search(Search, SpecsWithId) of
+		{value, #{ context := Context}} -> Context;
+		_ -> undefined
+	end;
+find_context(#{} = _Resp, _SpecsWithId) ->
+	undefined.
 
-%% @doc Gives each method-params pair a number. Returns a list of triples: method-params-id.
-enumerate_call_tuples(MethodParamsPairs, FirstId) ->
-	enumerate_call_tuples(MethodParamsPairs, FirstId, []).
 
-%% @doc Helper for enumerate_call_tuples/2.
-enumerate_call_tuples([{Method, Params} | MPs], NextId, Acc) ->
-	Triple = {Method, Params, NextId},
-	enumerate_call_tuples(MPs, NextId + 1, [Triple | Acc]);
-enumerate_call_tuples([], _, Acc) ->
-	lists:reverse(Acc).
+request(#{method := Mtd} = RequestSpec) ->
+	Method = case RequestSpec of
+		#{module := Mod} -> <<(atom_to_binary(Mod))/binary, $:, (atom_to_binary(Mtd))/binary>>;
+		_ -> Mtd
+	end,
+	_Req = maps:merge(#{jsonrpc => ~"2.0", method => Method}, maps:with([id, params], RequestSpec)).
 
-%% @doc Finds each pair {Id, Reply} for each Id in the range FirstId..LastId in the proplist
-%% Replies. Removes the id and returns the only the replies in the correct order.
-denumerate_replies(Replies, FirstId, LastId) ->
-	denumerate_replies(dict:from_list(Replies), FirstId, LastId, []).
 
-%% @doc Helper for denumerate_replies/3.
-denumerate_replies(ReplyDict, FirstId, LastId, Acc) when FirstId =< LastId ->
-	Reply = dict:fetch(FirstId, ReplyDict),
-	Acc1 = [Reply | Acc],
-	denumerate_replies(ReplyDict, FirstId + 1, LastId, Acc1);
-denumerate_replies(_, _, _, Acc) ->
-	lists:reverse(Acc).
+safe_eval(Scope, F, A) ->
+	safe_eval(Scope, erlang, apply, [F, A]).
+
+safe_eval(Scope, M, F, A) ->
+	try {ok, erlang:apply(M, F, A)}
+	catch Class:Reason:Stacktrace ->
+		?LOG_ERROR("Error: ~tp ~tp ~tp", [Class, Reason, Stacktrace]),
+		{error, {Scope, Reason}}
+	end.
+
+
+parse_response(R = #{
+	~"jsonrpc" := ~"2.0",
+	~"id" := Id,
+	~"error" := #{~"code" := Code, ~"message" := <<Message/binary>>} = Error
+}, Ids) when is_integer(Code) ->
+	case lists:member(Id, Ids) orelse Id =:= null of
+		true ->
+			Err = #{code => Code, message => Message},
+			ErrB = case Error of
+				#{data := Data} -> Err#{data => Data};
+				_ -> Err
+			end,
+			{error, {error_response, ErrB}};
+		false ->
+			{error, {invalid_response, R}}
+	end;
+
+parse_response(R = #{
+	~"jsonrpc" := ~"2.0",
+	~"id" := Id,
+	~"result" := Result
+}, Ids) ->
+	case lists:member(Id, Ids) orelse Id =:= null of
+		true ->
+			{ok, Result};
+		false ->
+			{error, {invalid_response, R}}
+	end;
+
+parse_response(R, _Ids) ->
+	{error, {invalid_response, R}}.
+
 
 %%------------
 %% Unit tests
 %%------------
 
 -ifdef(TEST).
+
+
 -include_lib("eunit/include/eunit.hrl").
 
-enumerate_call_tuples_test() ->
-	Input  = [{x, foo}, {y, bar}, {z, baz}],
-	FirstId = 3,
-	Expect = [{x, foo, 3}, {y, bar, 4}, {z, baz, 5}],
-	Expect = enumerate_call_tuples(Input, FirstId).
 
-denumerate_replies_test() ->
-	Input = [{3, foo}, {5, baz}, {4, bar}],
-	FirstId = 3,
-	LastId = 5 = FirstId + length(Input) - 1,
-	Expect = [foo, bar, baz],
-	Expect = denumerate_replies(Input, FirstId, LastId).
+test_handler(<<"add">>, [A, B]) -> {ok, A+B};
+test_handler(<<"notify">>, []) -> ok.
 
-transport_error_test() ->
-	TransportFun = fun (_) -> throw({transport_error, <<"404 or whatever">>}) end,
-	JsonEncode = fun (_) -> <<"foo">> end,
-	JsonDecode = fun (_) -> [] end,
-	MethodsAndParams = [{<<"foo">>, []}],
-	Expect = [{error, {server_error, <<"404 or whatever">>}}],
-	?assertEqual(Expect, batch_call(MethodsAndParams, TransportFun, JsonDecode, JsonEncode, 1)).
 
-transport_return_invalid_json_test() ->
-	TransportFun = fun (_) -> <<"some non-JSON junk">> end,
-	JsonEncode = fun (_) -> <<"{\"foo\":\"bar\"}">> end,
-	JsonDecode = fun (_) -> throw(invalid_json) end,
-	MethodsAndParams = [{<<"foo">>, []}],
-	Expect = [{error, {server_error, invalid_json}}],
-	?assertEqual(Expect, batch_call(MethodsAndParams, TransportFun, JsonDecode, JsonEncode, 1)).
+test_transport(Req) ->
+	case jsonrpc2:handle(Req, fun test_handler/2) of
+		{reply, Reply} -> iolist_to_binary(Reply);
+		noreply -> <<>>
+	end.
+
+
+call__1_test() ->
+	?assertEqual({ok, 7}, call(#{id => 1, method => add, params => [-1,8]}, fun test_transport/1)),
+	?assertEqual(ok,      call(#{         method => add, params => [-1,8]}, fun test_transport/1)).
+
+
+call_2_test() ->
+	?assertEqual({ok, 7}, call(#{id => 1, method => add, params => [-1,8]}, fun test_transport/1)),
+	?assertEqual(ok,      call(#{         method => notify}, fun test_transport/1)).
+
+
+multi_call_1_test() ->
+	Req = [ #{id => 1, method => add, params => [-1,8]} ],
+	?assertEqual([{ok, 7, undefined}], multi_call(Req, fun test_transport/1, 1)).
+
+
+multi_call_2_test() ->
+	Ctx = #{ctx => 3000},
+	Req = [ #{id => 1, method => add, params => [-1,8], context => Ctx} ],
+	?assertEqual([{ok, 7, Ctx}], multi_call(Req, fun test_transport/1, 1)).
+
+
+multi_call_3_test() ->
+	Req = [
+		#{id => auto, method => add, params => [-1,8], context =>  #{ctx => 1000}},
+		#{id => auto, method => add, params => [-1,9], context =>  #{ctx => 2000}},
+		#{id => auto, method => add, params => [-1,10], context =>  #{ctx => 3000}}
+	],
+	?assertEqual([
+		{ok, 7, #{ctx => 1000}},
+		{ok, 8, #{ctx => 2000}},
+		{ok, 9, #{ctx => 3000}}
+	], multi_call(Req, fun test_transport/1, 10)).
+
+
+multi_call_4_test() ->
+	Req = [
+		#{id => auto, method => add,   params => [-1,8]},
+		#{            method => notify                 }
+	],
+	?assertEqual([ {ok, 7, undefined} ], multi_call(Req, fun test_transport/1, 10)).
+
+
+multi_call_5_test() ->
+	Req = [
+		#{id =>  98, method => add,   params => [98,0],  context => a},
+		#{           method => notify,                   context => c},
+		#{id => -98, method => add,   params => [0,-98], context => b}
+	],
+	?assertEqual([ {ok, 98, a}, {ok, -98, b} ], multi_call(Req, fun test_transport/1, 10)).
+
+
+multi_call_6_test() ->
+	Req = [ #{method => add, params => [-1,8]} ],
+	?assertEqual(ok, multi_call(Req, fun test_transport/1, 1)).
+
 
 -endif.
